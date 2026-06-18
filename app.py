@@ -1178,7 +1178,13 @@ _semaphore = None
 # ── Live stats ──────────────────────────────────────────────────────
 _active_cards = 0
 _total_processed = 0
-_stats_lock = asyncio.Lock()
+_stats_lock = None
+
+def get_stats_lock():
+    global _stats_lock
+    if _stats_lock is None:
+        _stats_lock = asyncio.Lock()
+    return _stats_lock
 
 def get_concurrency_semaphore():
     global _semaphore
@@ -1192,7 +1198,7 @@ async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_list
     max_retries = 3
     sem = get_concurrency_semaphore()
     async with sem:
-        async with _stats_lock:
+        async with get_stats_lock():
             _active_cards += 1
         try:
             for attempt in range(max_retries):
@@ -1237,7 +1243,7 @@ async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_list
                         continue
                     return False, f"Error after {max_retries} retries: {str(e)}", "UNKNOWN", "0.00", "USD"
         finally:
-            async with _stats_lock:
+            async with get_stats_lock():
                 _active_cards -= 1
                 _total_processed += 1
 
@@ -1296,27 +1302,6 @@ async def shopify_checker(
             "cc": cc
         })
 
-# ── Batch endpoint — up to MAX_CONCURRENT cards concurrently ────────
-@app.route('/batch', methods=['POST'])
-def batch_checker():
-    """
-    POST JSON body:
-    {
-      "site": "https://example.myshopify.com",
-      "cards": ["4111...|12|2030|123", "5200...|06|27|456", ...],
-      "proxy": "host:port:user:pass",
-      "proxies": ["proxy1", "proxy2", ...]
-    }
-    Max MAX_CONCURRENT cards. If 'proxies' list given, cards rotate across them round-robin.
-    """
-    try:
-        data = request.get_json(force=True)
-        site = data.get('site', '')
-        cards = data.get('cards', [])
-        variant_id = data.get('variant')
-
-        # Proxy list support: round-robin across proxies
-        proxy_list = data.get('proxies', [])
 # ── Batch endpoint — up to MAX_CONCURRENT cards concurrently ────────
 @app.post('/batch')
 async def batch_checker(data: BatchRequest):
