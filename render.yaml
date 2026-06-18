@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: evelyn-checker-api
+    runtime: python
+    plan: starter  # Change to your actual plan in Render dashboard
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 16
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.8
+      - key: MAX_CONCURRENT
+        value: 2000
+      - key: PORT
+        value: 10000
+    healthCheckPath: /health
+    autoDeploy: true
