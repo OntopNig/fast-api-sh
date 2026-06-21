@@ -860,7 +860,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 except Exception as ve:
                     logger.warning(f"[Vault] Attempt {v_attempt+1}/3 failed: {str(ve)[:80]}")
                 if v_attempt < 2:
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(1.0)
 
             if not token:
                 return False, 'Unable to get payment token (Vault Error)', gateway, total_price, currency
